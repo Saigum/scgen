@@ -1,151 +1,296 @@
-from torch.nn import functional as f
-from torch import nn, optim
-import torch as th
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
-from torch.utils.data import DataLoader,Dataset
-from  preprocessing import load_data
-import argparse
+import scanpy as sc
 from tqdm import tqdm
 
+##############################################################################
+#                                DATA LOADING                                #
+##############################################################################
 
-data_path = "../dataset/pbmc_perturb"
-### Sample B is the perturbed set,
-### Sample A is the non perturbed set.
+# Example placeholders for your data paths
+train_data_path = "train_pbmc.h5ad"
+val_data_path   = "valid_pbmc.h5ad"
+
+# Read Anndata
+train_adata = sc.read_h5ad(train_data_path)
+val_adata   = sc.read_h5ad(val_data_path)
+
+# 1) Highly Variable Gene Selection on the train set
+#    to ensure we select the same HVGs for train and val.
+#    We'll pick e.g. top 2000 HVGs from train_adata.
+sc.pp.highly_variable_genes(train_adata, flavor="seurat", n_top_genes=2000)
+
+# Subset train_adata to only HVGs
+train_adata = train_adata[:, train_adata.var['highly_variable']]
+
+# Subset val_adata to the same HVGs (intersection on gene names)
+val_adata = val_adata[:, train_adata.var_names]
+
+# A few optional preprocess steps (log1p, scale, etc.),
+# depending on how your data was preprocessed already:
+# sc.pp.log1p(train_adata)
+# sc.pp.log1p(val_adata)
+# sc.pp.scale(train_adata)
+# sc.pp.scale(val_adata)
+# (Be consistent in your train/val transformations!)
+
+# Convert .X to torch tensors
+X_train = torch.tensor(train_adata.X.toarray(), dtype=torch.float32)
+X_val   = torch.tensor(val_adata.X.toarray(), dtype=torch.float32)
 
 
-device = th.device("cuda" if th.cuda.is_available() else "cpu")
+# Identify which cells are "stimulated" or "unstimulated".
+# For simplicity, we'll assume:
+#   - train_adata.obs['condition'] in {'stimulated','control'}
+#   - val_adata.obs['condition']   in {'stimulated','control'}
+# Adjust to your actual metadata columns accordingly.
+train_pert_mask = (train_adata.obs['condition'] == 'stimulated').values
+train_ctrl_mask = (train_adata.obs['condition'] == 'control').values
 
-def reparametrize(mu:th.Tensor,logvar:th.Tensor):
-    return(mu + (th.exp(2*logvar)*th.randn(size=mu.shape[1])))
+val_pert_mask = (val_adata.obs['condition'] == 'stimulated').values
+val_ctrl_mask = (val_adata.obs['condition'] == 'control').values
+
+##############################################################################
+#                                DATASET CLASS                               #
+##############################################################################
+
+class TrainingCellData(Dataset):
+    def __init__(self, X):
+        """
+        X: torch.Tensor of shape [n_cells, n_genes]
+        """
+        super().__init__()
+        self.X = X
+
+    def __getitem__(self, index):
+        return self.X[index]
+
+    def __len__(self):
+        return self.X.shape[0]
+
+train_dataset = TrainingCellData(X_train)
+val_dataset   = TrainingCellData(X_val)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+##############################################################################
+#                               MODEL DEFINITION                             #
+##############################################################################
+
+def reparametrize(mu: torch.Tensor, logvar: torch.Tensor):
+    """
+    Reparameterization trick:
+    z = mu + sigma * eps, where sigma = exp(0.5 * logvar).
+    """
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)  # same shape as std
+    return mu + std * eps
 
 class VAE(nn.Module):
-    def __init__(self,input_dim,hidden_layers,latent_dim):
-        layers = [input_dim] + hidden_layers
-        layers.append(latent_dim)
-        self.encoder_block = nn.Sequential([nn.Sequential
-                                            (nn.Linear(layers[i],layers[i+1]),nn.ReLU()) 
-                                            for i in range(len(layers)-1)])
-        self.decoder_block = nn.Sequential([nn.Sequential
-                                            (nn.Linear(layers[i],layers[i-1]),nn.ReLU()) 
-                                            for i in range(len(layers)-1,-1,-1)])
-        self.mu = nn.Sequential(nn.Linear(latent_dim,latent_dim),nn.ReLU())
-        self.logvar = nn.Sequential(nn.Linear(latent_dim,latent_dim),nn.ReLU())
-    def forward(self,x):
+    def __init__(self, input_dim, hidden_layers, latent_dim):
+        super().__init__()
+        """
+        Example:
+          input_dim = 2000
+          hidden_layers = [512, 256, 128]
+          latent_dim = 64
+        """
+
+        # Build encoder
+        encoder_modules = []
+        prev_dim = input_dim
+        for h_dim in hidden_layers:
+            encoder_modules.append(nn.Linear(prev_dim, h_dim))
+            encoder_modules.append(nn.ReLU())
+            prev_dim = h_dim
+        # Final layer to go down to some 'intermediate' dimension
+        encoder_modules.append(nn.Linear(prev_dim, latent_dim))
+        encoder_modules.append(nn.ReLU())
+        self.encoder_block = nn.Sequential(*encoder_modules)
+
+        # Separate heads for mu and logvar
+        self.mu_head = nn.Linear(latent_dim, latent_dim)
+        self.logvar_head = nn.Linear(latent_dim, latent_dim)
+
+        # Build decoder (reverse)
+        decoder_modules = []
+        reversed_layers = list(reversed(hidden_layers))
+        # First layer: latent_dim -> last hidden
+        decoder_modules.append(nn.Linear(latent_dim, reversed_layers[0]))
+        decoder_modules.append(nn.ReLU())
+        prev_dim = reversed_layers[0]
+        # Add intermediate hidden layers
+        for h_dim in reversed_layers[1:]:
+            decoder_modules.append(nn.Linear(prev_dim, h_dim))
+            decoder_modules.append(nn.ReLU())
+            prev_dim = h_dim
+        # Final layer: to go back to input_dim
+        decoder_modules.append(nn.Linear(prev_dim, input_dim))
+        # We typically might not have a ReLU on the output, or
+        # might have e.g. nn.Sigmoid() if data is normalized [0,1].
+        # Adjust to your needs. For now, do no final activation:
+        self.decoder_block = nn.Sequential(*decoder_modules)
+
+    def encode(self, x):
+        """
+        Pass input through encoder; produce mu, logvar
+        """
         encoded = self.encoder_block(x)
-        mu,logvar = self.mu(encoded),self.logvar(encoded)
-        decoded = self.decoder_block(reparametrize(mu,logvar))
-        return decoded,mu,logvar
+        mu = self.mu_head(encoded)
+        logvar = self.logvar_head(encoded)
+        return mu, logvar
 
+    def decode(self, z):
+        return self.decoder_block(z)
 
-## for this dataset, I'm going to assume you provide 2 adatas.
-## one being adata's for the perturbed set
-## one being adata for the non-perturbed set, they need not be equal in size.
-class TrainingCellData(Dataset):
-    def __init__(self,adata,is_perturbed=0):
-        self.adata = adata
-        self.is_perturbed = is_perturbed
-    def __getitem__(self, index):
-        ## Equivalent to you getting it for a cell
-        # n_cells x n_genes
-        gene_vector = th.zeros(self.adata.shape[1])
-        gene_vector = self.adata.X[index]
-        return gene_vector
-    def __len__(self):
-        return(self.adata.shape[0])
-    
+    def forward(self, x):
+        """
+        Standard VAE forward:
+          1) encode
+          2) reparam
+          3) decode
+          4) return reconstruction, mu, logvar
+        """
+        mu, logvar = self.encode(x)
+        z = reparametrize(mu, logvar)
+        reconstruction = self.decode(z)
+        return reconstruction, mu, logvar
 
+##############################################################################
+#                           TRAINING & EVALUATION                            #
+##############################################################################
 
-adata_peturbed,adata_unperturbed = load_data(data_path)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
+# Hyperparams
+input_dim     = X_train.shape[1]  # should be 2000 if HVG=2000
+hidden_layers = [512, 256, 128]
+latent_dim    = 64
+lr            = 1e-3
+num_epochs    = 10
 
-# def leave_cell_type(adata_perturbed,cell_type):
-#     cell_type_vectors = adata_perturbed[]
+model = VAE(input_dim, hidden_layers, latent_dim).to(device)
+optimizer = optim.Adam(model.parameters(), lr=lr)
 
-## for the validation phase, we'll look at validation losses,
-## so the recon loss, and kl_loss
-## we'll also look at the accuracy of prediction of the gene set for the left out cell type.
+def kl_divergence(mu, logvar):
+    # Standard formula for each sample:
+    # KL = -0.5 * \sum(1 + logvar - mu^2 - exp(logvar))
+    # Return the mean over batch, or sum, depending on how you want to scale
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    return torch.sum(kld)
 
+for epoch in range(1, num_epochs+1):
+    model.train()
+    train_recon_loss = 0.0
+    train_kl_loss = 0.0
 
-def accuracy(mu,logvar)
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False):
+        batch = batch.to(device)
 
+        optimizer.zero_grad()
+        recon, mu, logvar = model(batch)
+        # Reconstruction loss (MSE, or could use e.g. F.binary_cross_entropy())
+        recon_loss = F.mse_loss(recon, batch, reduction='mean')
+        # KL
+        kld = kl_divergence(mu, logvar)
+        # Total VAE loss
+        loss = recon_loss + kld
+        loss.backward()
+        optimizer.step()
 
-## for validation, we'll leave a celltype out, and try predicting  it's drug response
-## we'll have two levels, firstly to see if the direction of drug response is the same.
-## secondly we'll see as to how close our drug response prediction is ?
-## try using a vamp for this ??/
-## try excluding a cell_type in the train_set for val.
-# 
+        train_recon_loss += recon_loss.item() * batch.size(0)
+        train_kl_loss    += kld.item() * batch.size(0)
 
-hvg_size = 2000
+    # Average epoch losses
+    train_recon_loss /= len(train_loader.dataset)
+    train_kl_loss    /= len(train_loader.dataset)
 
-## have a cell_specific loader too, where you can choose excluded cell types.
+    # Validation
+    model.eval()
+    val_recon_loss = 0.0
+    val_kl_loss = 0.0
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False):
+            batch = batch.to(device)
+            recon, mu, logvar = model(batch)
+            recon_loss = F.mse_loss(recon, batch, reduction='mean')
+            kld = kl_divergence(mu, logvar)
 
+            val_recon_loss += recon_loss.item() * batch.size(0)
+            val_kl_loss    += kld.item() * batch.size(0)
 
-train_set = TrainingCellData(adata)
-val_set = TrainingCellData(val_adata)
-trainloader = DataLoader(train_set,batch_size=4)
-valloader =DataLoader(val_set,batch_size=4)
+    val_recon_loss /= len(val_loader.dataset)
+    val_kl_loss    /= len(val_loader.dataset)
 
-hidden_layers = [512,256,128]
-latent_dim=64
-num_epochs = 100
-lr = 3e3
-model = VAE(hvg_size,hidden_layers,latent_dim).to(device)
-optimizer = optim.adagrad(VAE.parameters(),lr)
+    print(f"[Epoch {epoch}] "
+          f"Train Recon: {train_recon_loss:.4f} | Train KL: {train_kl_loss:.4f} || "
+          f"Val Recon: {val_recon_loss:.4f} | Val KL: {val_kl_loss:.4f}")
 
-with tqdm(total=len(trainloader)*num_epochs) as pbar:
-    ### training phase
-    for epoch in range(1,num_epochs+1):
-        epoch_wise_recon_loss =0
-        epoch_wise_kl_loss = 0
-        for batch in trainloader:
-            optimizer.zero_grad()
-            reconstruction,mu,logvar = model(batch.to(device))
-            recon_loss = f.mse_loss(reconstruction,batch)
-            kl_loss = 0.5(-logvar.sum() -1 + mu.T@mu  + logvar.exp() )
-            loss = recon_loss + kl_loss
-            loss.backward()
-            optimizer.step()
-            pbar.write(f'Loss: {loss.item()}')
-            pbar.update()
-            epoch_wise_recon_loss += recon_loss
-            epoch_wise_kl_loss += kl_loss
-        epoch_wise_kl_loss = epoch_wise_kl_loss/len(trainloader)
-        epoch_wise_recon_loss = epoch_wise_recon_loss/len(trainloader)
-        print(f"Recon Loss for epoch {epoch} is {epoch_wise_recon_loss}")
-        print(f"KL Loss for epoch {epoch} is {epoch_wise_kl_loss}")
+##############################################################################
+#                  PREDICTING PERTURBATION FROM UNstimulated                 #
+##############################################################################
+# We'll define a function that takes:
+#   model      - the trained VAE
+#   unpert_X   - tensor of unstimulated cells [N, G]
+#   pert_X     - tensor of stimulated cells   [M, G]
+#
+# Strategy:
+#  1) Encode unpert_X => mu_unpert
+#  2) Encode pert_X   => mu_pert
+#  3) mean_unpert = average of mu_unpert
+#     mean_pert   = average of mu_pert
+#  4) For each unpert cell, create z_pred[i] = mu_unpert[i] + (mean_pert - mean_unpert)
+#  5) Decode z_pred[i] => predicted expression of the "stimulated" version
+#  6) Compare to actual stimulated expression (in some aggregated sense).
+#     Without a 1-to-1 cell mapping, we often compare average expression:
+#       MSE( mean of predicted_pert , mean of actual_pert_X )
+#     or we can do other strategies if your data is matched.
 
-        ## validation phase.
-        with tqdm(total=len(valloader),leave=False) as pbar:
-            epoch_wise_recon_loss =0
-            epoch_wise_kl_loss = 0
-            model.eval()
-            with th.no_grad():
-                for batch in valloader:
-                    reconstruction,mu,logvar = model(batch.to(device))
-                    recon_loss = f.mse_loss(reconstruction,batch)
-                    kl_loss = 0.5(-logvar.sum() -1 + mu.T@mu  + logvar.exp() )
-                    epoch_wise_recon_loss += recon_loss.item()
-                    epoch_wise_kl_loss += kl_loss
-                epoch_wise_kl_loss = epoch_wise_kl_loss/len(valloader)
-                epoch_wise_recon_loss = epoch_wise_recon_loss/len(valloader)
-                print(f"Val Recon Loss for epoch {epoch} is {epoch_wise_recon_loss}")
-                print(f"Val KL Loss for epoch {epoch} is {epoch_wise_kl_loss}")
-            ## now let's calculate  how well it predicts the 100 degs
-            ## and how well it predicts the actual 
+def predict_perturbation_and_mse(model, unpert_X, pert_X):
+    """
+    Returns an MSE measure between the average predicted expression
+    and the average actual expression for the stimulated set.
+    """
+    model.eval()
+    with torch.no_grad():
+        # Move data to device
+        unpert_X = unpert_X.to(device)
+        pert_X   = pert_X.to(device)
 
-                
+        # Encode both sets
+        mu_unpert, logvar_unpert = model.encode(unpert_X)
+        mu_pert,   logvar_pert   = model.encode(pert_X)
 
-            
+        # Compute mean latent vectors
+        mean_unpert = mu_unpert.mean(dim=0)  # shape [latent_dim]
+        mean_pert   = mu_pert.mean(dim=0)    # shape [latent_dim]
+        diff        = mean_pert - mean_unpert
 
-            
+        # Predict the "stimulated" version for each unpert cell
+        preds_list = []
+        for i in range(unpert_X.shape[0]):
+            z_pred = mu_unpert[i] + diff
+            x_pred = model.decode(z_pred.unsqueeze(0))  # shape [1, G]
+            preds_list.append(x_pred.squeeze(0))
 
+        preds = torch.stack(preds_list, dim=0)    # [N_unpert, G]
+        avg_pred = preds.mean(dim=0)             # [G]
 
-        
-    
+        # Compare to actual mean of pert_X
+        avg_pert = pert_X.mean(dim=0)            # [G]
+        mse = F.mse_loss(avg_pred, avg_pert, reduction='mean')
+        return mse.item()
 
+# Example usage on validation set:
+# In the validation set, separate out the unstimulated cells and stimulated cells
+X_val_unpert = X_val[val_ctrl_mask]
+X_val_pert   = X_val[val_pert_mask]
 
-
-
-
-        
+mse_val = predict_perturbation_and_mse(model, X_val_unpert, X_val_pert)
+print(f"Validation MSE for perturbation prediction = {mse_val:.4f}")
