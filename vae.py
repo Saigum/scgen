@@ -58,23 +58,13 @@ class TrainingCellData(Dataset):
 adata_peturbed,adata_unperturbed = load_data(data_path)
 
 
-# def leave_cell_type(adata_perturbed,cell_type):
-#     cell_type_vectors = adata_perturbed[]
 
-## for the validation phase, we'll look at validation losses,
-## so the recon loss, and kl_loss
-## we'll also look at the accuracy of prediction of the gene set for the left out cell type.
 
 
 def accuracy(mu,logvar)
 
 
-## for validation, we'll leave a celltype out, and try predicting  it's drug response
-## we'll have two levels, firstly to see if the direction of drug response is the same.
-## secondly we'll see as to how close our drug response prediction is ?
-## try using a vamp for this ??/
-## try excluding a cell_type in the train_set for val.
-# 
+
 
 hvg_size = 2000
 
